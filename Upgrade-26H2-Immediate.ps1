@@ -18,7 +18,7 @@ $Iso=Join-Path $Root 'Win11-26H2.iso'
 $IsoHash='BD4307DF32BC8AF33B39CCECB1174AEB345386630F89A2B86C7A4E36B55EA650'
 $FidoUrl='https://raw.githubusercontent.com/sctcoder1/SOPHOS26h2/main/Fido-26H2.ps1'
 $FidoHash='B2182411881FE34B84FB44454B4451F9BA7190C587C3D542AEE26682101072E3'
-$Fallback='https://mscourts.sharepoint.com/:u:/s/ITDeployment/IQDLA0o0bCpTRaDUiogR_LrLAXbQOnNzgCQKILDzZeQm6OE?e=VnDx2U'
+$Fallback='https://mscourts.sharepoint.com/:u:/s/ITDeployment/IQDLA0o0bCpTRaDUiogR_LrLAXbQOnNzgCQKILDzZeQm6OE?e=B768Ux'
 function Assert-Path([string]$Path){
     $p=[IO.Path]::GetFullPath($Path)
     while($p){
@@ -162,10 +162,10 @@ function Install-LocalTasks([string]$Source){
         if(Test-Path -LiteralPath $Worker){
             $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $Source).Hash
             if($deployedHash -ne $newHash){
-                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6/v7/v8/v9/v10 pre-install migration; no replacement attempted'}
+                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6/v7/v8/v9/v10/v11 pre-install migration; no replacement attempted'}
                 foreach($name in $Tasks){$existing=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue;if($existing -and $existing.State -eq 'Running'){throw 'Existing task is running; retry migration after it finishes'}}
                 Copy-Item -LiteralPath $Source -Destination $Worker -Force
-                Log 'Updated reviewed v5/v6/v7/v8/v9/v10 worker before installation; existing reboot history, state and servicing retained'
+                Log 'Updated reviewed v5/v6/v7/v8/v9/v10/v11 worker before installation; existing reboot history, state and servicing retained'
             }
         }else{Copy-Item -LiteralPath $Source -Destination $Worker}
         Stage-Launcher
@@ -297,7 +297,18 @@ function Download([string]$Url,[string]$Path,[string]$Hash){
     $part=$Path+'.partial'; Assert-Path $part
     Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
     Start-BitsTransfer -Source $Url -Destination $part -DisplayName $jobName -Priority Foreground -RetryInterval 60 -RetryTimeout 3600
-    if((Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash -ne $Hash){Remove-Item -LiteralPath $part -Force; throw 'Downloaded bytes do not match SHA256 pin'}
+    $actual=(Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash
+    if($actual -ne $Hash){
+        $bytes=(Get-Item -LiteralPath $part).Length
+        $html='Unknown';$stream=$null
+        try{
+            $stream=[IO.File]::OpenRead($part);$head=New-Object byte[] 512;$read=$stream.Read($head,0,$head.Length)
+            $prefix=[Text.Encoding]::UTF8.GetString($head,0,$read).TrimStart([char]0xFEFF).TrimStart()
+            $html=[string]($prefix -match '(?is)^(<!doctype\s+html|<html|<head|<body|<form)')
+        }catch{}finally{if($stream){$stream.Dispose()}}
+        Remove-Item -LiteralPath $part -Force
+        throw ('SHA256 mismatch: file='+[IO.Path]::GetFileName($Path)+'; sourceHost='+([uri]$Url).Host+'; bytes='+$bytes+'; looksLikeHTML='+$html+'; expected='+$Hash+'; actual='+$actual+'; rejected partial removed; no installation started')
+    }
     Move-Item -LiteralPath $part -Destination $Path -Force
 }
 function Signature([string]$Path){
@@ -339,19 +350,38 @@ function Restart([string]$Reason,[switch]$PreUpgrade){
         throw
     }
 }
+function Assert-MicrosoftIsoUri([string]$Value){
+    $uri=$null
+    if(-not [uri]::TryCreate($Value,[UriKind]::Absolute,[ref]$uri)){throw 'Fido returned an invalid absolute URL'}
+    # The exact ISO SHA256 and mounted-image verification establish media identity;
+    # a filename spelling is not a trust boundary. Keep the explicit host boundary.
+    if($uri.Scheme -ne 'https' -or $uri.Host -notin @('software.download.prss.microsoft.com','software-static.download.prss.microsoft.com','software-download.microsoft.com') -or -not $uri.IsDefaultPort -or $uri.UserInfo -or $uri.Fragment){
+        throw ('Rejected ISO URL: scheme='+$uri.Scheme+'; host='+$uri.Host+'; path='+$uri.AbsolutePath+'; expected an allowed HTTPS Microsoft host without credentials, custom port or fragment')
+    }
+    return $uri
+}
+function Get-FidoDownloadUrl([string]$Path){
+    $out=& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Path -Win 11 -Rel '26H2' -Ed Pro -Lang English -Arch x64 -GetUrl 2>&1
+    if($LASTEXITCODE -ne 0){throw ('Fido URL query failed; exit='+$LASTEXITCODE)}
+    $urls=@($out|ForEach-Object {([string]$_).Trim()}|Where-Object {$_ -match '^https://'})
+    if($urls.Count -ne 1){throw ('Expected exactly one Fido HTTPS URL; received '+$urls.Count)}
+    return $urls[0]
+}
 function Acquire-Iso {
     if((Test-Path -LiteralPath $Iso) -and (Get-FileHash -LiteralPath $Iso -Algorithm SHA256).Hash -eq $IsoHash){return}
     try{
         $f=Join-Path $Root 'Fido.ps1'; Download $FidoUrl $f $FidoHash
-        $out=& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f -Win 11 -Rel '26H2' -Ed Pro -Lang English -Arch x64 -GetUrl 2>&1
-        if($LASTEXITCODE -ne 0){throw 'Fido failed'}
-        $urls=@($out|ForEach-Object {[string]$_}|Where-Object {$_ -match '^https://'})
-        if($urls.Count -ne 1){throw 'Unexpected Fido URL result'}
-        $u=[uri]$urls[0]
-        if($u.Scheme -ne 'https' -or $u.Host -notin @('software.download.prss.microsoft.com','software-static.download.prss.microsoft.com','software-download.microsoft.com') -or $u.AbsolutePath -notmatch '(?i)Win11_26H2_English_x64.*\.iso$'){throw 'Unexpected Microsoft ISO URL'}
-        Download $u.AbsoluteUri $Iso $IsoHash
-    }catch{Log ('Primary ISO failed: '+$_.Exception.Message); Download $Fallback $Iso $IsoHash}
+        $candidate=Get-FidoDownloadUrl $f
+        $uri=Assert-MicrosoftIsoUri $candidate
+        Log ('Primary ISO URL accepted: host='+$uri.Host+'; path='+$uri.AbsolutePath+'; URL query omitted; exact ISO hash still required')
+        Download $uri.AbsoluteUri $Iso $IsoHash
+    }catch{
+        Log ('Primary ISO failed: '+$_.Exception.Message)
+        Log 'Trying supplied SharePoint fallback; exact ISO hash remains required'
+        Download $Fallback $Iso $IsoHash
+    }
 }
+
 function Iso-Upgrade($o){
     # v9 unsupported-hardware attempt: honor existing configuration, without
     # changing registry values, deleting appraiser data or modifying media.
@@ -464,7 +494,7 @@ function Install-OfferedUpdate($session,$chosen,[bool]$Feature,$o){
 function Test-ReviewedWorkerMigration([string]$Hash){
     # Never reset state or replace an installation that may have started.
     if($script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){return $false}
-    if($Hash -in '9BF31597C2D2CD959BDA781325198718C3A15958D93B43F10141066BD558E675','CD6D8F63B5E7437B57FFD9F0EA4B95533F850F5DFE9BD4854D83C8886FAB9BE6','2C46792579FAC24EDA6C4D3A4C16E05DB863BF75AFB5227D68C2C2CB3F922D20','2BCA66C534FDE64FD7CF84D8A2330CC5047D805548B24488EB8C0187A4D22750'){
+    if($Hash -in '9BF31597C2D2CD959BDA781325198718C3A15958D93B43F10141066BD558E675','CD6D8F63B5E7437B57FFD9F0EA4B95533F850F5DFE9BD4854D83C8886FAB9BE6','2C46792579FAC24EDA6C4D3A4C16E05DB863BF75AFB5227D68C2C2CB3F922D20','2BCA66C534FDE64FD7CF84D8A2330CC5047D805548B24488EB8C0187A4D22750','D6459382CE731180BCB48548FF8337991CE41F253D73D9A3EBD5CD56635336F0'){
         # A completed pre-upgrade reboot is allowed; preserve its history.
         return ($script:State.Phase -in 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning')
     }
