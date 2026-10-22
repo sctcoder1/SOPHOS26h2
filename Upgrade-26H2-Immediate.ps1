@@ -18,7 +18,7 @@ $Iso=Join-Path $Root 'Win11-26H2.iso'
 $IsoHash='BD4307DF32BC8AF33B39CCECB1174AEB345386630F89A2B86C7A4E36B55EA650'
 $FidoUrl='https://raw.githubusercontent.com/sctcoder1/SOPHOS26h2/main/Fido-26H2.ps1'
 $FidoHash='B2182411881FE34B84FB44454B4451F9BA7190C587C3D542AEE26682101072E3'
-$Fallback='https://mscourts.sharepoint.com/:u:/s/ITDeployment/IQDLA0o0bCpTRaDUiogR_LrLAXbQOnNzgCQKILDzZeQm6OE?e=B768Ux'
+$Fallback='https://mscourts.sharepoint.com/:u:/s/ITDeployment/IQDLA0o0bCpTRaDUiogR_LrLAXbQOnNzgCQKILDzZeQm6OE?e=B768Ux&download=1'
 function Assert-Path([string]$Path){
     $p=[IO.Path]::GetFullPath($Path)
     while($p){
@@ -162,10 +162,10 @@ function Install-LocalTasks([string]$Source){
         if(Test-Path -LiteralPath $Worker){
             $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $Source).Hash
             if($deployedHash -ne $newHash){
-                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6/v7/v8/v9/v10/v11 pre-install migration; no replacement attempted'}
+                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6/v7/v8/v9/v10/v11/v12 pre-install migration; no replacement attempted'}
                 foreach($name in $Tasks){$existing=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue;if($existing -and $existing.State -eq 'Running'){throw 'Existing task is running; retry migration after it finishes'}}
                 Copy-Item -LiteralPath $Source -Destination $Worker -Force
-                Log 'Updated reviewed v5/v6/v7/v8/v9/v10/v11 worker before installation; existing reboot history, state and servicing retained'
+                Log 'Updated reviewed v5/v6/v7/v8/v9/v10/v11/v12 worker before installation; existing reboot history, state and servicing retained'
             }
         }else{Copy-Item -LiteralPath $Source -Destination $Worker}
         Stage-Launcher
@@ -494,7 +494,7 @@ function Install-OfferedUpdate($session,$chosen,[bool]$Feature,$o){
 function Test-ReviewedWorkerMigration([string]$Hash){
     # Never reset state or replace an installation that may have started.
     if($script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){return $false}
-    if($Hash -in '9BF31597C2D2CD959BDA781325198718C3A15958D93B43F10141066BD558E675','CD6D8F63B5E7437B57FFD9F0EA4B95533F850F5DFE9BD4854D83C8886FAB9BE6','2C46792579FAC24EDA6C4D3A4C16E05DB863BF75AFB5227D68C2C2CB3F922D20','2BCA66C534FDE64FD7CF84D8A2330CC5047D805548B24488EB8C0187A4D22750','D6459382CE731180BCB48548FF8337991CE41F253D73D9A3EBD5CD56635336F0'){
+    if($Hash -in '9BF31597C2D2CD959BDA781325198718C3A15958D93B43F10141066BD558E675','CD6D8F63B5E7437B57FFD9F0EA4B95533F850F5DFE9BD4854D83C8886FAB9BE6','2C46792579FAC24EDA6C4D3A4C16E05DB863BF75AFB5227D68C2C2CB3F922D20','2BCA66C534FDE64FD7CF84D8A2330CC5047D805548B24488EB8C0187A4D22750','D6459382CE731180BCB48548FF8337991CE41F253D73D9A3EBD5CD56635336F0','B74CD326D65CA5D54F8E0D9E9D995018E5C7895EEA882443AEAF4E6F1FE659A1'){
         # A completed pre-upgrade reboot is allowed; preserve its history.
         return ($script:State.Phase -in 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning')
     }
