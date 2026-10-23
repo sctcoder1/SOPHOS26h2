@@ -320,8 +320,26 @@ function Native([string]$Exe,[string]$Arguments){
     while(-not $p.WaitForExit(30000)){Log "Waiting for native PID $($p.Id); no timeout or termination"}
     $null=$p.WaitForExit(); $code=$p.ExitCode; $p.Dispose(); Log "Native exit: $code"; return $code
 }
-function Restart([string]$Reason,[switch]$PreUpgrade){
-    $restartBlock=Get-BusyReason -ForPreReboot:$PreUpgrade
+function Resume-CompletedRestart([string]$Reason){
+    if(-not $script:awake){$script:awake=Start-StayAwake}
+    while($true){
+        $now=Snapshot
+        if($script:State.Phase -notin 'OnlineComplete','AwaitingRestart','RestartWarning' -or -not $script:State.InstallBoot -or $script:State.InstallBoot -ne $now.Boot -or $script:State.PrereqInFlight){throw 'Completed-upgrade restart recovery requires confirmed completion on this boot'}
+        if(-not (Pending) -and -not $script:State.NativeRequiresRestart){throw 'Completed phase has no confirmed reboot requirement; review required'}
+        # Presence of TiWorker alone is not an active-install indication. WUA,
+        # Setup/DISM/WUSA, setup flags and other deployment workers still block.
+        $block=Get-BusyReason -ForPreReboot
+        if($block){
+            Save 'OnlineComplete' ('Automatic restart recovery waiting: '+$block)
+        }else{
+            Restart $Reason -CompletedUpgrade
+            if($script:State.RebootBoot -eq $now.Boot){return}
+        }
+        Start-Sleep -Seconds 30
+    }
+}
+function Restart([string]$Reason,[switch]$PreUpgrade,[switch]$CompletedUpgrade){
+    $restartBlock=Get-BusyReason -ForPreReboot:($PreUpgrade -or $CompletedUpgrade)
     if($restartBlock){throw ('Deferred: no restart while '+$restartBlock)}
     if(-not $script:awake){$script:awake=Start-StayAwake}
     $boot=(Snapshot).Boot
@@ -338,7 +356,7 @@ function Restart([string]$Reason,[switch]$PreUpgrade){
     try{
         for($i=0;$i -lt 120;$i++){
             Start-Sleep -Seconds 5
-            if(Get-BusyReason -ForPreReboot:$PreUpgrade){
+            if(Get-BusyReason -ForPreReboot:($PreUpgrade -or $CompletedUpgrade)){
                 & "$env:SystemRoot\System32\shutdown.exe" /a|Out-Null
                 if($LASTEXITCODE -ne 0){throw 'Restart cancellation failed; immediate operator attention required'}
                 $script:State.RebootBoot=''; Save 'AwaitingRestart' 'Servicing started during countdown; cancelled our restart'; return
@@ -427,8 +445,8 @@ function Iso-Upgrade($o){
         }
         $script:State.NativeRequiresRestart=($code -eq 3010)
         Save 'OnlineComplete' 'Setup exited successfully with /noreboot'
-        if(Busy){throw 'Setup/servicing still active after parent exited; restart deferred'}
-        if((Pending) -or $script:State.NativeRequiresRestart){Restart 'Windows Setup online phase finished'}else{Save 'ManualAttention' 'Setup returned 0 but no confirmed reboot marker; inspect Panther before restarting'; Disable-OwnedTasks}
+
+        if((Pending) -or $script:State.NativeRequiresRestart){Resume-CompletedRestart 'Windows Setup online phase finished'}else{Save 'ManualAttention' 'Setup returned 0 but no confirmed reboot marker; inspect Panther before restarting'; Disable-OwnedTasks}
     }finally{
         if(-not (Busy)){Dismount-DiskImage -ImagePath $Iso -ErrorAction SilentlyContinue}
     }
@@ -492,6 +510,12 @@ function Install-OfferedUpdate($session,$chosen,[bool]$Feature,$o){
     elseif((Snapshot).UBR -lt 9711){Save 'ManualAttention' 'Prerequisite did not reach expected October baseline'; Disable-OwnedTasks}
 }
 function Test-ReviewedWorkerMigration([string]$Hash){
+    if($Hash -eq '81989168AA6933B51ADC1E9E51E4BB54B04B23962CF8E7C21D3E15680ECEF509'){
+        if($script:State.PrereqInFlight){return $false}
+        if($script:State.Attempts -eq 0 -and $script:State.PrereqAttempts -eq 0 -and -not $script:State.InstallBoot){return ($script:State.Phase -in 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning')}
+        $now=Snapshot
+        return ($script:State.Phase -eq 'OnlineComplete' -and $script:State.Attempts -eq 1 -and $script:State.InstallBoot -eq $now.Boot -and $script:State.OriginalEdition -eq $now.Edition -and ((Pending) -or $script:State.NativeRequiresRestart) -and -not (Get-BusyReason -ForPreReboot))
+    }
     # Never reset state or replace an installation that may have started.
     if($script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){return $false}
     if($Hash -in 'E165134F4D0BD43439CC12365C76BB8F9E87115E97387AFCE9EC0D9E758BB9E0','604A83EF03C43324F0B66843A657114BE111B04B7C21BCB7102CE5FB22C68F65','E5E2AD96AB7860C738C1EC6E459F587B8E669576766CF71ADDE526496D467F80','BA207B1701D59868AAE96C2AFAC8359869CECD749732E9E9712F119E4C9FD261','D12B6EB34969F1DF4FF3CCCBD25E3C282B6CA89C33C523A2E04D09EFDF7BC512','C8D7B75A8F07526D17B4408D390F696657BDB43993A490AD487D570EE32FD938'){
@@ -583,6 +607,9 @@ try{
     if($script:State.PrereqInFlight -isnot [bool]){throw 'Invalid prerequisite recovery flag'}
     $null=[datetime]::Parse($script:State.CreatedUtc)
     $stateValid=$true
+    if($Install -and $script:State.Phase -eq 'OnlineComplete' -and (Test-Path -LiteralPath $Worker) -and (Test-ReviewedWorkerMigration (Get-FileHash -LiteralPath $Worker).Hash)){
+        Install-LocalTasks -Source $PSCommandPath; exit 0
+    }
     $o=Snapshot; $route=Route $o
     if($route -eq 'Complete'){
         if($script:State.PrereqInFlight){Save 'ManualAttention' 'Interrupted update operation; inspect servicing before completion'; Disable-OwnedTasks; exit 1}
@@ -590,13 +617,14 @@ try{
         Complete-Cleanup; exit 0
     }
     if($route -eq 'Inconsistent' -and -not $Install -and $script:State.InstallBoot -eq $o.Boot -and $script:State.Phase -in 'OnlineComplete','AwaitingRestart','RestartWarning'){
-        Restart 'Owned completed online phase has staged a kernel transition'; exit 0
+        Resume-CompletedRestart 'Owned completed online phase has staged a kernel transition'; exit 0
     }
     if($route -in 'Unsupported','Inconsistent'){throw "Unsupported/inconsistent OS: $($o|ConvertTo-Json -Compress)"}
     if(-not $script:State.OriginalEdition){$script:State.OriginalEdition=$o.Edition}
     if($Install){Install-LocalTasks -Source $PSCommandPath; exit 0}
     if($script:State.Phase -in 'Complete','ManualAttention'){exit 0}
     $script:State.Runs++; Save $script:State.Phase 'Worker entered'
+    if($script:State.Phase -in 'OnlineComplete','AwaitingRestart','RestartWarning' -and $script:State.InstallBoot -eq $o.Boot){Resume-CompletedRestart 'Previously completed online phase'; exit 0}
     if(Handle-PreReboot $o){exit 0}
     if(Busy -ForUpgrade){Save $script:State.Phase ('Waiting; retained recovery phase. '+$script:LastBusyReason); exit 0}
     if($script:State.PrereqInFlight){Save 'ManualAttention' 'Interrupted/partial cumulative-update install; review Windows Update/CBS before resuming'; Disable-OwnedTasks; exit 1}
@@ -612,7 +640,7 @@ try{
         Save 'Ready' 'Cumulative update complete; rechecking running build threshold'
     }
     if($script:State.Phase -in 'OnlineComplete','AwaitingRestart','RestartWarning'){
-        Restart 'Previously completed online phase'; exit 0
+        Resume-CompletedRestart 'Previously completed online phase'; exit 0
     }
     if(Pending){Restart 'Existing Windows servicing requires restart before upgrade'; exit 0}
     if(-not $awake){$awake=Start-StayAwake}
