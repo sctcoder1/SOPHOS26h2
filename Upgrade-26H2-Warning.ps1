@@ -373,11 +373,59 @@ function Resume-CompletedRestart([string]$Reason){
             Save 'OnlineComplete' ('Automatic restart recovery waiting: '+$block)
         }else{
             Restart $Reason -CompletedUpgrade
-            if($script:State.RebootBoot -eq $now.Boot){return}
+            if($script:State.Phase -eq 'AwaitingExternalRestart' -or $script:State.RebootBoot -eq $now.Boot){return}
         }
         Start-Sleep -Seconds 30
     }
 }
+function Notify-UpgradeRestart([string]$Message,[int]$Delay){
+    try{& "$env:SystemRoot\System32\msg.exe" '*' (('/TIME:')+$Delay) $Message 2>&1|Out-Null}catch{Log 'msg notification unavailable; shutdown notification will be used'}
+}
+function Request-UpgradeRestart([int]$Delay,[string]$Message){
+    $previous=$ErrorActionPreference
+    try{
+        $ErrorActionPreference='Continue'
+        $output=@(& "$env:SystemRoot\System32\shutdown.exe" /r /f /t $Delay /d p:2:3 /c $Message 2>&1)
+        $code=[int]$LASTEXITCODE
+    }finally{$ErrorActionPreference=$previous}
+    foreach($line in $output){Log ('shutdown.exe: '+[string]$line)}
+    Log ('shutdown.exe exit: '+$code)
+    return $code
+}
+function Handle-ExternalRestart($Os){
+    if($script:State.Phase -ne 'AwaitingExternalRestart'){return $false}
+    if(-not $script:State.RebootBoot){throw 'External restart recovery has no recorded boot identity'}
+    if($script:State.RebootBoot -eq $Os.Boot){
+        Save 'AwaitingExternalRestart' 'Another component already scheduled shutdown/restart; waiting for a new boot without cancelling or replacing it'
+        return $true
+    }
+    if($script:State.InstallBoot){$phase='OnlineComplete'}elseif($script:State.PrereqBoot){$phase='PrerequisiteComplete'}else{$phase='PreRebootPending'}
+    Save $phase 'External restart completed; resuming existing recovery checks with preserved installation/reboot history'
+    return $false
+}
+function Test-CompletedExternalPrereboot([string]$Hash,$Os){
+    if($Hash -notin '81989168AA6933B51ADC1E9E51E4BB54B04B23962CF8E7C21D3E15680ECEF509','70EE3FB0B8C8E792BBBF64457089A8AAE0DE6CBC9ACFA69CA136F8E89CEB76DD','C7A2E7F347FB9E99E28804A824D9460982942106F0CDC2883F9D1204BB080D44'){return $false}
+    if($script:State.Phase -ne 'ManualAttention' -or $script:State.Detail -ne 'Restart request failed' -or $script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.PrereqInFlight -or $script:State.InstallBoot){return $false}
+    if(-not $script:State.PreRebootBoot -or $script:State.PreRebootBoot -eq $Os.Boot -or $script:State.RebootBoot -ne $script:State.PreRebootBoot -or $script:State.OriginalEdition -ne $Os.Edition){return $false}
+    $failedAt=[datetimeoffset]::Parse($script:State.UpdatedUtc).UtcDateTime
+    if([datetimeoffset]::Parse($Os.Boot).UtcDateTime -le $failedAt -or (Pending) -or (Get-BusyReason -ForPreReboot)){return $false}
+    $log=Join-Path $Root 'Launcher.log';Assert-Path $log
+    if(-not (Test-Path -LiteralPath $log -PathType Leaf)){return $false}
+    $lines=@(Get-Content -LiteralPath $log -Tail 300 -ErrorAction Stop)
+    for($i=$lines.Count-1;$i -ge 0;$i--){
+        if($lines[$i] -match '\(1190\)\s*$'){
+            for($j=$i+1;$j -lt [math]::Min($i+6,$lines.Count);$j++){
+                if($lines[$j] -match '^(\S+) ManualAttention : Could not schedule restart; existing external shutdown left alone$'){
+                    $when=[datetimeoffset]::Parse($Matches[1]).UtcDateTime
+                    return ([math]::Abs(($failedAt-$when).TotalSeconds) -le 120)
+                }
+            }
+            return $false
+        }
+    }
+    return $false
+}
+
 function Restart([string]$Reason,[switch]$PreUpgrade,[switch]$CompletedUpgrade){
     $restartBlock=Get-BusyReason -ForPreReboot:($PreUpgrade -or $CompletedUpgrade)
     if($restartBlock){throw ('Deferred: no restart while '+$restartBlock)}
@@ -387,11 +435,15 @@ function Restart([string]$Reason,[switch]$PreUpgrade,[switch]$CompletedUpgrade){
     if(-not (Pending) -and -not $script:State.NativeRequiresRestart){throw 'No confirmed reboot requirement'}
     Save 'RestartWarning' $Reason
     $message='Windows 11 upgrade requires a restart in 600 seconds. Save your work now; applications will be forcibly closed.'
-    try{& "$env:SystemRoot\System32\msg.exe" '*' /TIME:600 $message 2>&1|Out-Null}catch{Log 'msg notification unavailable; shutdown notification will be used'}
+    Notify-UpgradeRestart $message 600
     # Native shutdown shows the countdown. Continuously cancel it if servicing starts.
     $script:State.RebootBoot=$boot; $script:State.Reboots++; Save 'AwaitingRestart' $Reason
-    & "$env:SystemRoot\System32\shutdown.exe" /r /f /t 600 /d p:2:3 /c $message
-    if($LASTEXITCODE -ne 0){Save 'ManualAttention' 'Could not schedule restart; existing external shutdown left alone'; Disable-OwnedTasks; throw 'Restart request failed'}
+    $restartCode=Request-UpgradeRestart 600 $message
+    if($restartCode -in 1190,1115){
+        Save 'AwaitingExternalRestart' ('Windows already has a shutdown/restart scheduled or in progress (native code '+$restartCode+'); recovery tasks remain enabled')
+        return
+    }
+    if($restartCode -ne 0){Save 'ManualAttention' ('Restart request failed; native shutdown code '+$restartCode+'; inspect Launcher.log'); Disable-OwnedTasks; throw ('Restart request failed; native code '+$restartCode)}
 
     try{
         for($i=0;$i -lt 120;$i++){
@@ -550,7 +602,8 @@ function Install-OfferedUpdate($session,$chosen,[bool]$Feature,$o){
     elseif((Snapshot).UBR -lt 9711){Save 'ManualAttention' 'Prerequisite did not reach expected October baseline'; Disable-OwnedTasks}
 }
 function Test-ReviewedWorkerMigration([string]$Hash){
-    if($Hash -in '81989168AA6933B51ADC1E9E51E4BB54B04B23962CF8E7C21D3E15680ECEF509','70EE3FB0B8C8E792BBBF64457089A8AAE0DE6CBC9ACFA69CA136F8E89CEB76DD'){
+    if($script:State.Phase -eq 'ManualAttention' -and (Test-CompletedExternalPrereboot $Hash (Snapshot))){return $true}
+    if($Hash -in '81989168AA6933B51ADC1E9E51E4BB54B04B23962CF8E7C21D3E15680ECEF509','70EE3FB0B8C8E792BBBF64457089A8AAE0DE6CBC9ACFA69CA136F8E89CEB76DD','C7A2E7F347FB9E99E28804A824D9460982942106F0CDC2883F9D1204BB080D44'){
         if($script:State.PrereqInFlight){return $false}
         if($script:State.Attempts -eq 0 -and $script:State.PrereqAttempts -eq 0 -and -not $script:State.InstallBoot){return ($script:State.Phase -in 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning')}
         $now=Snapshot
@@ -650,7 +703,14 @@ try{
     if($Install -and $script:State.Phase -eq 'OnlineComplete' -and (Test-Path -LiteralPath $Worker) -and (Test-ReviewedWorkerMigration (Get-FileHash -LiteralPath $Worker).Hash)){
         Install-LocalTasks -Source $PSCommandPath; exit 0
     }
-    $o=Snapshot; $route=Route $o
+    $o=Snapshot
+    if($Install -and $script:State.Phase -eq 'ManualAttention' -and (Test-Path -LiteralPath $Worker) -and (Test-CompletedExternalPrereboot (Get-FileHash -LiteralPath $Worker).Hash $o)){
+        Install-LocalTasks -Source $PSCommandPath
+        Save 'PreRebootPending' 'Recovered verified external prereboot after native error 1190; existing ISO, attempts and reboot history retained'
+        exit 0
+    }
+    if(-not $Install -and (Handle-ExternalRestart $o)){exit 0}
+    $route=Route $o
     if($route -eq 'Complete'){
         if($script:State.PrereqInFlight){Save 'ManualAttention' 'Interrupted update operation; inspect servicing before completion'; Disable-OwnedTasks; exit 1}
         if($script:State.OriginalEdition -and $script:State.OriginalEdition -ne $o.Edition){Save 'ManualAttention' 'Target build reached but edition changed'; Disable-OwnedTasks; exit 1}
@@ -689,7 +749,7 @@ try{
     $failure=$_.Exception.Message
     if($locked -and $stateValid){
         # Failure after native install may have left servicing staged. Never retry/reboot on speculation.
-        try{if($script:State.Phase -in 'Cleaning','CleanupPending'){Save 'CleanupPending' $failure}elseif($script:State.PrereqInFlight -or $script:State.Phase -in 'InstallingISO','InstallingUpdate','Scanning'){Save 'ManualAttention' $failure; Disable-OwnedTasks}elseif($script:State.Phase -in 'OnlineComplete','AwaitingRestart','RestartWarning','PrerequisiteComplete','ManualAttention'){Save $script:State.Phase $failure}else{Save 'Deferred' $failure}}catch{}
+        try{if($script:State.Phase -in 'Cleaning','CleanupPending'){Save 'CleanupPending' $failure}elseif($script:State.PrereqInFlight -or $script:State.Phase -in 'InstallingISO','InstallingUpdate','Scanning'){Save 'ManualAttention' $failure; Disable-OwnedTasks}elseif($script:State.Phase -in 'OnlineComplete','AwaitingRestart','RestartWarning','PrerequisiteComplete','AwaitingExternalRestart','ManualAttention'){Save $script:State.Phase $failure}else{Save 'Deferred' $failure}}catch{}
     }
     Write-Error $failure -ErrorAction Continue; exit 1
 }finally{if($awake){Stop-StayAwake $awake}; if($locked){$mutex.ReleaseMutex()}; $mutex.Dispose()}
