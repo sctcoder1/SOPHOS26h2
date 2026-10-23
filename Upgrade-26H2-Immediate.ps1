@@ -162,10 +162,10 @@ function Install-LocalTasks([string]$Source){
         if(Test-Path -LiteralPath $Worker){
             $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $Source).Hash
             if($deployedHash -ne $newHash){
-                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6/v7/v8/v9/v10/v11/v12 pre-install migration; no replacement attempted'}
+                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Worker migration refused: hash/state/boot/edition/reboot evidence or active-install check did not pass; existing worker retained'}
                 foreach($name in $Tasks){$existing=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue;if($existing -and $existing.State -eq 'Running'){throw 'Existing task is running; retry migration after it finishes'}}
                 Copy-Item -LiteralPath $Source -Destination $Worker -Force
-                Log 'Updated reviewed v5/v6/v7/v8/v9/v10/v11/v12 worker before installation; existing reboot history, state and servicing retained'
+                Log 'Updated reviewed worker; existing completion state, reboot history and servicing retained'
             }
         }else{Copy-Item -LiteralPath $Source -Destination $Worker}
         Stage-Launcher
@@ -320,12 +320,52 @@ function Native([string]$Exe,[string]$Arguments){
     while(-not $p.WaitForExit(30000)){Log "Waiting for native PID $($p.Id); no timeout or termination"}
     $null=$p.WaitForExit(); $code=$p.ExitCode; $p.Dispose(); Log "Native exit: $code"; return $code
 }
+function Test-SetupRebootEvidence {
+    # Correlate our successful real install with Setup's own explicit reboot
+    # request. Generic Windows Update/CBS flags are not required for this case.
+    $now=Snapshot
+    if($script:State.Phase -notin 'OnlineComplete','AwaitingRestart','RestartWarning' -or $script:State.Attempts -ne 1 -or $script:State.PrereqInFlight -or -not $script:State.InstallBoot -or $script:State.InstallBoot -ne $now.Boot -or $script:State.OriginalEdition -ne $now.Edition){return $false}
+    $workerLog=Join-Path $Root 'worker.log'
+    $setupLog=Join-Path ($env:SystemDrive+'\') '$WINDOWS.~BT\Sources\Panther\setupact.log'
+    Assert-Path $workerLog; Assert-Path $setupLog
+    if(-not (Test-Path -LiteralPath $workerLog -PathType Leaf) -or -not (Test-Path -LiteralPath $setupLog -PathType Leaf)){return $false}
+    $lines=@(Get-Content -LiteralPath $workerLog -Tail 5000 -ErrorAction Stop)
+    $complete=$null
+    for($i=$lines.Count-1;$i -ge 1;$i--){
+        if($lines[$i] -match '^(\S+) OnlineComplete : Setup exited successfully with /noreboot$'){
+            $complete=[datetimeoffset]::Parse($Matches[1]).UtcDateTime
+            if($lines[$i-1] -notmatch '^(\S+) Native exit: (0|3010)$'){return $false}
+            $nativeTime=[datetimeoffset]::Parse($Matches[1]).UtcDateTime
+            if($nativeTime -gt $complete -or ($complete-$nativeTime).TotalSeconds -gt 60){return $false}
+            break
+        }
+    }
+    if(-not $complete -or $complete -lt ([datetimeoffset]::Parse($now.Boot).UtcDateTime) -or $complete -gt [datetime]::UtcNow.AddMinutes(2)){return $false}
+    $tail=@(Get-Content -LiteralPath $setupLog -Tail 200 -ErrorAction Stop)
+    $pendingTime=$null;$overrideTime=$null;$finalize=$false
+    foreach($line in $tail){
+        if($line -notmatch '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),'){continue}
+        $time=[datetime]::ParseExact($Matches[1],'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeLocal).ToUniversalTime()
+        if([math]::Abs(($time-$complete).TotalSeconds) -gt 120){continue}
+        if($line.Contains('Setup phase change: [SetupPhaseInstall] -> [SetupPhasePostFinalize]')){$finalize=$true}
+        if($line.Contains('SetupHost: Reporting pending reboot event')){$pendingTime=$time}
+        if($line.Contains('SetupManager: Rebooting system... prevented by command line override.')){$overrideTime=$time}
+    }
+    $lastWrite=(Get-Item -LiteralPath $setupLog -ErrorAction Stop).LastWriteTimeUtc
+    return ($finalize -and $null -ne $pendingTime -and $null -ne $overrideTime -and $overrideTime -ge $pendingTime -and [math]::Abs(($lastWrite-$complete).TotalSeconds) -le 120)
+}
+
+
 function Resume-CompletedRestart([string]$Reason){
     if(-not $script:awake){$script:awake=Start-StayAwake}
     while($true){
         $now=Snapshot
         if($script:State.Phase -notin 'OnlineComplete','AwaitingRestart','RestartWarning' -or -not $script:State.InstallBoot -or $script:State.InstallBoot -ne $now.Boot -or $script:State.PrereqInFlight){throw 'Completed-upgrade restart recovery requires confirmed completion on this boot'}
-        if(-not (Pending) -and -not $script:State.NativeRequiresRestart){throw 'Completed phase has no confirmed reboot requirement; review required'}
+        if(-not $script:State.NativeRequiresRestart -and (Test-SetupRebootEvidence)){
+            $script:State.NativeRequiresRestart=$true
+            Save $script:State.Phase 'Setup log and owned successful installation confirm the suppressed first reboot; automatic restart recovery retained'
+        }
+        if(-not (Pending) -and -not $script:State.NativeRequiresRestart){throw 'Completed phase has no confirmed reboot requirement; Setup evidence missing or mismatched'}
         # Presence of TiWorker alone is not an active-install indication. WUA,
         # Setup/DISM/WUSA, setup flags and other deployment workers still block.
         $block=Get-BusyReason -ForPreReboot
@@ -446,7 +486,7 @@ function Iso-Upgrade($o){
         $script:State.NativeRequiresRestart=($code -eq 3010)
         Save 'OnlineComplete' 'Setup exited successfully with /noreboot'
 
-        if((Pending) -or $script:State.NativeRequiresRestart){Resume-CompletedRestart 'Windows Setup online phase finished'}else{Save 'ManualAttention' 'Setup returned 0 but no confirmed reboot marker; inspect Panther before restarting'; Disable-OwnedTasks}
+        if((Pending) -or $script:State.NativeRequiresRestart -or (Test-SetupRebootEvidence)){Resume-CompletedRestart 'Windows Setup online phase finished'}else{Save 'ManualAttention' 'Setup returned 0 but no confirmed reboot marker; inspect Panther before restarting'; Disable-OwnedTasks}
     }finally{
         if(-not (Busy)){Dismount-DiskImage -ImagePath $Iso -ErrorAction SilentlyContinue}
     }
@@ -510,11 +550,11 @@ function Install-OfferedUpdate($session,$chosen,[bool]$Feature,$o){
     elseif((Snapshot).UBR -lt 9711){Save 'ManualAttention' 'Prerequisite did not reach expected October baseline'; Disable-OwnedTasks}
 }
 function Test-ReviewedWorkerMigration([string]$Hash){
-    if($Hash -eq '6B70AFB06406F851BB1FA537F3AEFCEE7AF25D8E1A2A5D62695CC1E4B4A7BD26'){
+    if($Hash -in '6B70AFB06406F851BB1FA537F3AEFCEE7AF25D8E1A2A5D62695CC1E4B4A7BD26','31CB190E55E573CCB57803B94F796A1E6BF909D97645AB621BC7EEF3F7800C80'){
         if($script:State.PrereqInFlight){return $false}
         if($script:State.Attempts -eq 0 -and $script:State.PrereqAttempts -eq 0 -and -not $script:State.InstallBoot){return ($script:State.Phase -in 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning')}
         $now=Snapshot
-        return ($script:State.Phase -eq 'OnlineComplete' -and $script:State.Attempts -eq 1 -and $script:State.InstallBoot -eq $now.Boot -and $script:State.OriginalEdition -eq $now.Edition -and ((Pending) -or $script:State.NativeRequiresRestart) -and -not (Get-BusyReason -ForPreReboot))
+        return ($script:State.Phase -eq 'OnlineComplete' -and $script:State.Attempts -eq 1 -and $script:State.InstallBoot -eq $now.Boot -and $script:State.OriginalEdition -eq $now.Edition -and ((Pending) -or $script:State.NativeRequiresRestart -or (Test-SetupRebootEvidence)) -and -not (Get-BusyReason -ForPreReboot))
     }
     # Never reset state or replace an installation that may have started.
     if($script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){return $false}
